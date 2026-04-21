@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"generator/helpers"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -18,6 +20,8 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/quic-go/quic-go/http3"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 func generateURL(username string) string {
@@ -59,8 +63,6 @@ func ParseRoomDossierFromHTML(htmlStr string) (map[string]any, error) {
 
 	}
 	decoded = strings.Trim(decoded, "\"")
-
-	fmt.Println("RAW", decoded)
 	var result map[string]any
 	if err := json.Unmarshal([]byte(decoded), &result); err != nil {
 		return nil, err
@@ -69,7 +71,7 @@ func ParseRoomDossierFromHTML(htmlStr string) (map[string]any, error) {
 
 }
 
-func fetchLegacy(username string) (url string, err error) {
+func fetchLegacyEx(username string) (url string, err error) {
 	client := &http.Client{
 		Transport: &http3.Transport{},
 	}
@@ -200,25 +202,62 @@ func fetchQUIC(username string) (string, error) {
 	return string(body), nil
 }
 
-func fetchUniversal(username string) (string, error) {
-	var errs []error
-	if res, err := fetchQUIC(username); err == nil && res != "" {
-		return res, nil
-	} else {
-		errs = append(errs, fmt.Errorf("fetchQUIC failed: %w", err))
-	}
-	if res, err := fetch(username); err == nil && res != "" {
-		return res, nil
-	} else {
-		errs = append(errs, fmt.Errorf("fetch failed: %w", err))
-	}
-	if res, err := fetchLegacy(username); err == nil && res != "" {
-		return res, nil
-	} else {
-		errs = append(errs, fmt.Errorf("fetchLegacy failed: %w", err))
-	}
-	return "", fmt.Errorf("all fetch methods failed: %v", errs)
+func newClient() *http.Client {
+	jar, _ := cookiejar.New(nil)
 
+	tr := &http.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := net.DialTimeout(network, addr, 10*time.Second)
+			if err != nil {
+				return nil, err
+			}
+
+			host := addr
+			if strings.Contains(addr, ":") {
+				host = strings.Split(addr, ":")[0]
+			}
+
+			config := &utls.Config{
+				ServerName: host,
+			}
+
+			// Chrome TLS fingerprint
+			uconn := utls.UClient(conn, config, utls.HelloChrome_Auto)
+
+			if err := uconn.Handshake(); err != nil {
+				return nil, err
+			}
+
+			return uconn, nil
+		},
+	}
+
+	return &http.Client{
+		Transport: tr,
+		Jar:       jar,
+		Timeout:   20 * time.Second,
+	}
+}
+
+func fetchLegacy(username string, pool *Pool) (string, error) {
+	url := generateURL(username)
+
+	html, err := pool.Fetch(url)
+	if err != nil {
+		return "", err
+	}
+
+	result, err := ParseRoomDossierFromHTML(html)
+	if err != nil {
+		return "", err
+	}
+
+	hls, ok := result["hls_source"].(string)
+	if !ok {
+		return "", fmt.Errorf("not found")
+	}
+
+	return hls, nil
 }
 
 func main() {
@@ -228,6 +267,8 @@ func main() {
 		WriteTimeout: 0,
 		IdleTimeout:  0,
 	})
+
+	pool := NewPool(5) // aynı anda 5 browser worker
 
 	app.Get("/online", func(c fiber.Ctx) error {
 		all, err := fetchAll()
@@ -267,7 +308,7 @@ func main() {
 
 	app.Get("/source/:username", func(c fiber.Ctx) error {
 		username := fiber.Params[string](c, "username")
-		json, jsonerr := fetchLegacy(username)
+		json, jsonerr := fetchLegacy(username, pool)
 		if jsonerr != nil {
 			return c.JSON(fiber.Map{
 				"success": false,
@@ -279,18 +320,6 @@ func main() {
 			"success": true,
 			"data":    json,
 		})
-	})
-
-	app.Get("/universal/:username", func(c fiber.Ctx) error {
-		username := fiber.Params[string](c, "username")
-		json, jsonerr := fetchUniversal(username)
-		if jsonerr != nil {
-			return c.JSON(fiber.Map{
-				"success": false,
-				"data":    "",
-			})
-		}
-		return c.SendString(json)
 	})
 
 	log.Fatal(app.Listen(":3000"))
