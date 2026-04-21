@@ -82,7 +82,7 @@ func fetchLegacyEx(username string) (url string, err error) {
 
 	result, err := ParseRoomDossierFromHTML(string(body))
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
 
 	hlsSource, ok := result["hls_source"].(string)
